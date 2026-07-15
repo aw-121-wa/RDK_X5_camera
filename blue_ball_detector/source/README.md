@@ -44,7 +44,7 @@ To also mark the warehouse cell that contains each blue ball, enable grid detect
 D:\RDK_X5\blue_ball_detector\bin\blue_ball_detector.exe --camera auto --display --grid-enable --grid-rows 3 --grid-cols 4 --cell-aspect 1.333333
 ```
 
-The preview detects visible warehouse grid lines, draws the blue-ball cells with yellow boxes, and labels cell numbers from left to right, top to bottom. It also uses the configured physical cell width/height ratio to reject grid candidates whose overall aspect is too far from the expected `cols * cell_aspect / rows`. If grid detection fails for a frame, the blue-ball overlay and CSV output continue normally and no wrong cell box is drawn.
+The preview first looks for the warehouse's stable visual markers: the continuous black top line and the separated white short lines below each cell. Those marker lines are used to derive the yellow cell boxes and labels from left to right, top to bottom. If the marker-based method cannot find a valid grid, the program falls back to the older full-grid-line detector. If grid detection fails for a frame, the blue-ball overlay and CSV output continue normally and no wrong cell box is drawn.
 
 Grid overlay uses the last valid grid for a short time to avoid flickering when one or two grid lines are missed in a frame. The default cache is 15 frames:
 
@@ -163,7 +163,7 @@ Warehouse grid overlay options:
 
 `--grid-enable` only affects the preview window. The CSV protocol remains the same 9 fields.
 `--cell-aspect` is the physical width/height ratio of one warehouse cell. The default is `1.333333` (4:3).
-`--grid-aspect-tolerance` is the accepted relative error of the detected whole-grid aspect ratio. The default is `0.35`.
+`--grid-aspect-tolerance` is the accepted relative error of the fallback whole-grid aspect ratio. The default is `0.35`.
 
 For higher processing/output frequency, remove the artificial delay:
 

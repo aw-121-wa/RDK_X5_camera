@@ -245,6 +245,78 @@ void drawSyntheticGrid(cv::Mat& frame, int rows, int cols)
     }
 }
 
+void drawSyntheticMarkerGrid(cv::Mat& frame, int rows, int cols)
+{
+    frame.setTo(cv::Scalar(40, 40, 40));
+
+    const int top = 20;
+    const int bottom = frame.rows - 20;
+    cv::line(frame, cv::Point(10, top), cv::Point(frame.cols - 11, top), cv::Scalar(0, 0, 0), 5);
+
+    const int cell_width = frame.cols / cols;
+    const int marker_width = std::max(16, cell_width - 18);
+    for (int row = 0; row < rows; ++row) {
+        const int y = top + (bottom - top) * (row + 1) / rows;
+        for (int col = 0; col < cols; ++col) {
+            const int center_x = cell_width * col + cell_width / 2;
+            cv::line(
+                frame,
+                cv::Point(center_x - marker_width / 2, y),
+                cv::Point(center_x + marker_width / 2, y),
+                cv::Scalar(255, 255, 255),
+                4);
+        }
+    }
+}
+
+void test_detects_marker_based_grid_from_black_top_line_and_white_bottom_segments()
+{
+    cv::Mat frame(140, 240, CV_8UC3);
+    drawSyntheticMarkerGrid(frame, 2, 3);
+
+    const GridDetectionResult grid = detectWarehouseGrid(frame, GridConfig{true, 2, 3});
+    const GridCell* cell = findContainingCell(grid.cells, cv::Point2f(120.0F, 45.0F));
+
+    assert(grid.found);
+    assert(grid.cells.size() == 6);
+    assert(cell != nullptr);
+    assert(cell->row == 0);
+    assert(cell->col == 1);
+    assert(cell->index == 2);
+}
+
+void test_marker_grid_rejects_mismatched_white_segment_count()
+{
+    cv::Mat frame(140, 240, CV_8UC3);
+    drawSyntheticMarkerGrid(frame, 2, 3);
+    cv::rectangle(frame, cv::Rect(165, 62, 70, 16), cv::Scalar(40, 40, 40), -1);
+
+    const GridDetectionResult grid = detectWarehouseGrid(frame, GridConfig{true, 2, 3});
+
+    assert(!grid.found);
+}
+
+void test_marker_grid_takes_priority_over_misleading_full_grid_lines()
+{
+    cv::Mat frame(170, 300, CV_8UC3);
+    drawSyntheticMarkerGrid(frame, 2, 3);
+
+    for (int x : {25, 125, 225, 285}) {
+        cv::line(frame, cv::Point(x, 40), cv::Point(x, 160), cv::Scalar(255, 255, 255), 2);
+    }
+    for (int y : {40, 100, 160}) {
+        cv::line(frame, cv::Point(25, y), cv::Point(285, y), cv::Scalar(255, 255, 255), 2);
+    }
+
+    const GridDetectionResult grid = detectWarehouseGrid(frame, GridConfig{true, 2, 3});
+    const GridCell* marker_cell = findContainingCell(grid.cells, cv::Point2f(150.0F, 30.0F));
+
+    assert(grid.found);
+    assert(marker_cell != nullptr);
+    assert(marker_cell->row == 0);
+    assert(marker_cell->col == 1);
+}
+
 void test_detects_grid_cells_in_reading_order()
 {
     cv::Mat frame(120, 240, CV_8UC3, cv::Scalar(0, 0, 0));
@@ -569,6 +641,9 @@ int main()
     test_draw_overlay_marks_center_and_ball();
     test_draw_overlay_marks_center_when_ball_missing();
     test_draw_overlay_marks_all_detected_balls();
+    test_detects_marker_based_grid_from_black_top_line_and_white_bottom_segments();
+    test_marker_grid_rejects_mismatched_white_segment_count();
+    test_marker_grid_takes_priority_over_misleading_full_grid_lines();
     test_detects_grid_cells_in_reading_order();
     test_finds_cell_containing_ball_center();
     test_draw_overlay_marks_blue_ball_cell_with_yellow_box();

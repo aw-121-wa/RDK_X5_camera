@@ -10,6 +10,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <numeric>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -579,6 +580,353 @@ bool gridAspectMatches(const std::vector<int>& x_lines, const std::vector<int>& 
     return ratio_error <= config.aspect_tolerance;
 }
 
+struct MarkerSegment {
+    int left = 0;
+    int right = 0;
+    int center_x = 0;
+    int center_y = 0;
+    int width = 0;
+    int height = 0;
+    int area = 0;
+};
+
+struct MarkerRow {
+    int center_y = 0;
+    std::vector<MarkerSegment> segments;
+};
+
+struct MarkerColumnSelection {
+    bool found = false;
+    std::vector<MarkerSegment> segments;
+    double spacing_variance = std::numeric_limits<double>::max();
+    int span = 0;
+};
+
+int clampInt(int value, int low, int high)
+{
+    return std::max(low, std::min(value, high));
+}
+
+int detectTopBlackLineY(const cv::Mat& frame)
+{
+    if (frame.empty()) {
+        return -1;
+    }
+
+    cv::Mat gray;
+    cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+
+    cv::Mat dark_mask;
+    cv::threshold(gray, dark_mask, 35, 255, cv::THRESH_BINARY_INV);
+    if (dark_mask.rows > 1) {
+        dark_mask.rowRange(dark_mask.rows / 2, dark_mask.rows).setTo(0);
+    }
+
+    const int kernel_width = std::max(25, frame.cols / 5);
+    cv::Mat closed;
+    cv::morphologyEx(
+        dark_mask,
+        closed,
+        cv::MORPH_CLOSE,
+        cv::getStructuringElement(cv::MORPH_RECT, cv::Size(kernel_width, 3)));
+
+    cv::Mat labels;
+    cv::Mat stats;
+    cv::Mat centroids;
+    const int count = cv::connectedComponentsWithStats(closed, labels, stats, centroids, 8, CV_32S);
+
+    const int min_width = std::max(60, frame.cols / 3);
+    const int max_height = std::max(8, frame.rows / 12);
+
+    int best_label = -1;
+    int best_width = 0;
+    int best_area = 0;
+    for (int label = 1; label < count; ++label) {
+        const int top = stats.at<int>(label, cv::CC_STAT_TOP);
+        const int width = stats.at<int>(label, cv::CC_STAT_WIDTH);
+        const int height = stats.at<int>(label, cv::CC_STAT_HEIGHT);
+        const int area = stats.at<int>(label, cv::CC_STAT_AREA);
+
+        if (top >= frame.rows / 2 || width < min_width || height > max_height) {
+            continue;
+        }
+
+        if (width > best_width || (width == best_width && area > best_area)) {
+            best_label = label;
+            best_width = width;
+            best_area = area;
+        }
+    }
+
+    if (best_label < 0) {
+        return -1;
+    }
+
+    const int top = stats.at<int>(best_label, cv::CC_STAT_TOP);
+    const int height = stats.at<int>(best_label, cv::CC_STAT_HEIGHT);
+    return top + height / 2;
+}
+
+std::vector<MarkerSegment> detectWhiteMarkerSegments(const cv::Mat& frame, int top_y, const GridConfig& config)
+{
+    std::vector<MarkerSegment> segments;
+    if (frame.empty() || config.cols <= 0) {
+        return segments;
+    }
+
+    cv::Mat hsv;
+    cv::cvtColor(frame, hsv, cv::COLOR_BGR2HSV);
+
+    cv::Mat white_mask;
+    cv::inRange(hsv, cv::Scalar(0, 0, 170), cv::Scalar(179, 90, 255), white_mask);
+    if (top_y > 0) {
+        const int clear_bottom = clampInt(top_y + 4, 0, white_mask.rows);
+        white_mask.rowRange(0, clear_bottom).setTo(0);
+    }
+
+    cv::morphologyEx(
+        white_mask,
+        white_mask,
+        cv::MORPH_CLOSE,
+        cv::getStructuringElement(cv::MORPH_RECT, cv::Size(9, 3)));
+    cv::morphologyEx(
+        white_mask,
+        white_mask,
+        cv::MORPH_OPEN,
+        cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 2)));
+
+    cv::Mat labels;
+    cv::Mat stats;
+    cv::Mat centroids;
+    const int count = cv::connectedComponentsWithStats(white_mask, labels, stats, centroids, 8, CV_32S);
+
+    const int min_width = std::max(10, frame.cols / std::max(12, config.cols * 8));
+    const int max_width =
+        std::max(min_width + 1, static_cast<int>((frame.cols / static_cast<double>(config.cols)) * 1.25));
+    const int max_height = std::max(8, frame.rows / 12);
+
+    for (int label = 1; label < count; ++label) {
+        const int left = stats.at<int>(label, cv::CC_STAT_LEFT);
+        const int top = stats.at<int>(label, cv::CC_STAT_TOP);
+        const int width = stats.at<int>(label, cv::CC_STAT_WIDTH);
+        const int height = stats.at<int>(label, cv::CC_STAT_HEIGHT);
+        const int area = stats.at<int>(label, cv::CC_STAT_AREA);
+
+        if (width < min_width || width > max_width || height < 1 || height > max_height) {
+            continue;
+        }
+
+        const double aspect = width / static_cast<double>(std::max(1, height));
+        if (aspect < 3.0 || area < std::max(12, width * height / 5)) {
+            continue;
+        }
+
+        MarkerSegment segment;
+        segment.left = left;
+        segment.right = left + width;
+        segment.center_x = static_cast<int>(std::lround(centroids.at<double>(label, 0)));
+        segment.center_y = static_cast<int>(std::lround(centroids.at<double>(label, 1)));
+        segment.width = width;
+        segment.height = height;
+        segment.area = area;
+        segments.push_back(segment);
+    }
+
+    return segments;
+}
+
+std::vector<MarkerRow> groupMarkerRows(std::vector<MarkerSegment> segments, int min_segments, int frame_rows)
+{
+    std::vector<MarkerRow> rows;
+    if (segments.empty()) {
+        return rows;
+    }
+
+    std::sort(segments.begin(), segments.end(), [](const MarkerSegment& a, const MarkerSegment& b) {
+        if (a.center_y == b.center_y) {
+            return a.center_x < b.center_x;
+        }
+        return a.center_y < b.center_y;
+    });
+
+    const int y_tolerance = std::max(5, frame_rows / 60);
+    MarkerRow current;
+    int y_sum = 0;
+    int count = 0;
+    for (const MarkerSegment& segment : segments) {
+        if (current.segments.empty()) {
+            current.segments.push_back(segment);
+            y_sum = segment.center_y;
+            count = 1;
+            current.center_y = segment.center_y;
+            continue;
+        }
+
+        if (std::abs(segment.center_y - current.center_y) <= y_tolerance) {
+            current.segments.push_back(segment);
+            y_sum += segment.center_y;
+            ++count;
+            current.center_y = static_cast<int>(std::lround(y_sum / static_cast<double>(count)));
+            continue;
+        }
+
+        if (static_cast<int>(current.segments.size()) >= min_segments) {
+            std::sort(current.segments.begin(), current.segments.end(), [](const MarkerSegment& a, const MarkerSegment& b) {
+                return a.center_x < b.center_x;
+            });
+            rows.push_back(current);
+        }
+
+        current = MarkerRow{};
+        current.segments.push_back(segment);
+        y_sum = segment.center_y;
+        count = 1;
+        current.center_y = segment.center_y;
+    }
+
+    if (static_cast<int>(current.segments.size()) >= min_segments) {
+        std::sort(current.segments.begin(), current.segments.end(), [](const MarkerSegment& a, const MarkerSegment& b) {
+            return a.center_x < b.center_x;
+        });
+        rows.push_back(current);
+    }
+
+    return rows;
+}
+
+MarkerColumnSelection chooseBestMarkerColumns(const std::vector<MarkerRow>& rows, int cols)
+{
+    MarkerColumnSelection best;
+    if (cols <= 0) {
+        return best;
+    }
+
+    for (const MarkerRow& row : rows) {
+        if (static_cast<int>(row.segments.size()) < cols) {
+            continue;
+        }
+
+        for (int start = 0; start + cols <= static_cast<int>(row.segments.size()); ++start) {
+            std::vector<MarkerSegment> run(row.segments.begin() + start, row.segments.begin() + start + cols);
+            std::vector<double> spacings;
+            for (int i = 1; i < static_cast<int>(run.size()); ++i) {
+                spacings.push_back(run[i].center_x - run[i - 1].center_x);
+            }
+
+            double variance = 0.0;
+            if (!spacings.empty()) {
+                const double mean = std::accumulate(spacings.begin(), spacings.end(), 0.0) / spacings.size();
+                if (mean <= 1.0) {
+                    continue;
+                }
+                for (double spacing : spacings) {
+                    const double delta = spacing - mean;
+                    variance += delta * delta;
+                }
+                variance /= spacings.size();
+            }
+
+            const int span = run.back().center_x - run.front().center_x;
+            if (!best.found || variance < best.spacing_variance ||
+                (std::abs(variance - best.spacing_variance) < 1e-6 && span > best.span)) {
+                best.found = true;
+                best.segments = run;
+                best.spacing_variance = variance;
+                best.span = span;
+            }
+        }
+    }
+
+    return best;
+}
+
+std::vector<int> markerXLines(const std::vector<MarkerSegment>& columns, int cols, int frame_width)
+{
+    std::vector<int> x_lines;
+    if (static_cast<int>(columns.size()) != cols || cols <= 0 || frame_width <= 1) {
+        return x_lines;
+    }
+
+    if (cols == 1) {
+        x_lines.push_back(clampInt(columns.front().left, 0, frame_width - 1));
+        x_lines.push_back(clampInt(columns.front().right, 0, frame_width - 1));
+        return x_lines;
+    }
+
+    std::vector<int> spacings;
+    for (int i = 1; i < cols; ++i) {
+        spacings.push_back(columns[i].center_x - columns[i - 1].center_x);
+    }
+    std::sort(spacings.begin(), spacings.end());
+    const int spacing = spacings[spacings.size() / 2];
+    if (spacing <= 1) {
+        return x_lines;
+    }
+
+    const int left =
+        clampInt(static_cast<int>(std::lround(columns.front().center_x - spacing / 2.0)), 0, frame_width - 2);
+    const int right =
+        clampInt(static_cast<int>(std::lround(columns.back().center_x + spacing / 2.0)), left + 1, frame_width - 1);
+
+    return fillEvenlySpacedLinesFromBounds(left, right, cols + 1);
+}
+
+std::vector<int> markerYLines(const std::vector<MarkerRow>& rows, int top_y, int expected_rows, int frame_height)
+{
+    std::vector<int> y_lines;
+    if (expected_rows <= 0 || static_cast<int>(rows.size()) < expected_rows || frame_height <= 1) {
+        return y_lines;
+    }
+
+    y_lines.push_back(clampInt(top_y, 0, frame_height - 2));
+    for (int i = 0; i < expected_rows; ++i) {
+        const int y = clampInt(rows[i].center_y, 0, frame_height - 1);
+        if (y <= y_lines.back()) {
+            return {};
+        }
+        y_lines.push_back(y);
+    }
+
+    return y_lines;
+}
+
+GridDetectionResult detectMarkerBasedWarehouseGrid(const cv::Mat& frame, const GridConfig& config)
+{
+    if (frame.empty() || config.rows <= 0 || config.cols <= 0) {
+        return GridDetectionResult{false, {}};
+    }
+
+    const int top_y = detectTopBlackLineY(frame);
+    if (top_y < 0) {
+        return GridDetectionResult{false, {}};
+    }
+
+    std::vector<MarkerSegment> segments = detectWhiteMarkerSegments(frame, top_y, config);
+    std::vector<MarkerRow> rows = groupMarkerRows(std::move(segments), config.cols, frame.rows);
+    if (static_cast<int>(rows.size()) < config.rows) {
+        return GridDetectionResult{false, {}};
+    }
+
+    std::sort(rows.begin(), rows.end(), [](const MarkerRow& a, const MarkerRow& b) {
+        return a.center_y < b.center_y;
+    });
+    rows.resize(static_cast<std::size_t>(config.rows));
+
+    const MarkerColumnSelection columns = chooseBestMarkerColumns(rows, config.cols);
+    if (!columns.found) {
+        return GridDetectionResult{false, {}};
+    }
+
+    const std::vector<int> x_lines = markerXLines(columns.segments, config.cols, frame.cols);
+    const std::vector<int> y_lines = markerYLines(rows, top_y, config.rows, frame.rows);
+    if (static_cast<int>(x_lines.size()) != config.cols + 1 ||
+        static_cast<int>(y_lines.size()) != config.rows + 1) {
+        return GridDetectionResult{false, {}};
+    }
+
+    return buildGridCells(x_lines, y_lines, config);
+}
+
 GridDetectionResult smoothGridDetections(
     const GridDetectionResult& previous,
     const GridDetectionResult& current,
@@ -748,6 +1096,11 @@ GridDetectionResult detectWarehouseGrid(const cv::Mat& frame, const GridConfig& 
 {
     if (!config.enabled || config.rows <= 0 || config.cols <= 0 || frame.empty()) {
         return GridDetectionResult{false, {}};
+    }
+
+    const GridDetectionResult marker_grid = detectMarkerBasedWarehouseGrid(frame, config);
+    if (marker_grid.found) {
+        return marker_grid;
     }
 
     cv::Mat gray;
