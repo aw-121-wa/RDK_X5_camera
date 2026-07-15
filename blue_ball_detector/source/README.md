@@ -74,11 +74,15 @@ Fields:
 
 ## Camera Selection
 
-Default behavior scans camera indexes `0` through `9` and uses the first device that can return a valid frame:
+Default behavior scans camera indexes `0` through `9` and prefers an external USB camera when one is detected:
 
 ```bash
 ./build/blue_ball_detector
 ```
+
+On RDK X5/Linux, automatic selection checks video device paths such as `/sys/class/video4linux` and `/dev/v4l/by-path` for USB cameras. On Windows PC testing, automatic selection prefers a readable camera index greater than `0`, because built-in cameras are commonly index `0` and external USB cameras are commonly index `1` or higher. If no external candidate is found, the program falls back to the lowest readable camera index.
+
+Startup logs show the selected camera index and whether automatic selection used an external-preferred candidate or fallback.
 
 Manually choose a camera:
 

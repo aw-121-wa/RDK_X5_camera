@@ -217,6 +217,53 @@ void test_draw_overlay_marks_all_detected_balls()
     assert(selected_ball_pixel[1] < 50);
 }
 
+void test_camera_selection_uses_only_available_camera()
+{
+    const std::vector<CameraCandidate> candidates{
+        CameraCandidate{2, true, false},
+    };
+
+    assert(choosePreferredCameraIndex(candidates) == 2);
+}
+
+void test_camera_selection_prefers_external_over_index_zero()
+{
+    const std::vector<CameraCandidate> candidates{
+        CameraCandidate{0, true, false},
+        CameraCandidate{1, true, true},
+    };
+
+    assert(choosePreferredCameraIndex(candidates) == 1);
+}
+
+void test_camera_selection_uses_lowest_external_index()
+{
+    const std::vector<CameraCandidate> candidates{
+        CameraCandidate{0, true, false},
+        CameraCandidate{3, true, true},
+        CameraCandidate{1, true, true},
+    };
+
+    assert(choosePreferredCameraIndex(candidates) == 1);
+}
+
+void test_camera_selection_falls_back_to_lowest_readable_index()
+{
+    const std::vector<CameraCandidate> candidates{
+        CameraCandidate{4, true, false},
+        CameraCandidate{2, true, false},
+    };
+
+    assert(choosePreferredCameraIndex(candidates) == 2);
+}
+
+void test_camera_selection_returns_negative_when_empty()
+{
+    const std::vector<CameraCandidate> candidates;
+
+    assert(choosePreferredCameraIndex(candidates) == -1);
+}
+
 } // namespace
 
 int main()
@@ -234,5 +281,10 @@ int main()
     test_draw_overlay_marks_center_and_ball();
     test_draw_overlay_marks_center_when_ball_missing();
     test_draw_overlay_marks_all_detected_balls();
+    test_camera_selection_uses_only_available_camera();
+    test_camera_selection_prefers_external_over_index_zero();
+    test_camera_selection_uses_lowest_external_index();
+    test_camera_selection_falls_back_to_lowest_readable_index();
+    test_camera_selection_returns_negative_when_empty();
     return 0;
 }

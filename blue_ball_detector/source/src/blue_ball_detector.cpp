@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cctype>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -41,6 +43,12 @@ struct DetectionBuffers {
     cv::Mat stats;
     cv::Mat centroids;
     cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5));
+};
+
+struct CameraSelection {
+    int index = -1;
+    bool automatic = false;
+    bool likely_external = false;
 };
 
 bool isFlag(const std::string& arg, const std::string& flag)
@@ -173,13 +181,83 @@ bool readValidFrame(cv::VideoCapture& capture)
     return false;
 }
 
-int resolveCameraIndex(const ProgramOptions& options)
+bool containsUsbPathToken(const std::string& path)
 {
-    if (options.camera == "auto") {
-        return findCameraIndex(options.scan_max);
+    std::string lower = path;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return lower.find("usb") != std::string::npos;
+}
+
+bool isLikelyExternalCameraIndex(int index)
+{
+#ifdef _WIN32
+    return index > 0;
+#else
+    namespace fs = std::filesystem;
+    const std::string video_name = "video" + std::to_string(index);
+    const fs::path sysfs_device = fs::path("/sys/class/video4linux") / video_name / "device";
+
+    std::error_code error;
+    const fs::path canonical_device = fs::weakly_canonical(sysfs_device, error);
+    if (!error && containsUsbPathToken(canonical_device.string())) {
+        return true;
     }
 
-    return parseIntValue(options.camera, "--camera");
+    const fs::path by_path_dir("/dev/v4l/by-path");
+    if (!fs::exists(by_path_dir, error) || error) {
+        return false;
+    }
+
+    for (const fs::directory_entry& entry : fs::directory_iterator(by_path_dir, error)) {
+        if (error) {
+            break;
+        }
+
+        const fs::path entry_path = entry.path();
+        if (!containsUsbPathToken(entry_path.string())) {
+            continue;
+        }
+
+        std::error_code target_error;
+        fs::path target = fs::read_symlink(entry_path, target_error);
+        if (target_error) {
+            continue;
+        }
+
+        if (target.is_relative()) {
+            target = entry_path.parent_path() / target;
+        }
+
+        const fs::path canonical_target = fs::weakly_canonical(target, target_error);
+        if (!target_error && canonical_target.filename() == video_name) {
+            return true;
+        }
+    }
+
+    return false;
+#endif
+}
+
+CameraSelection resolveCameraSelection(const ProgramOptions& options)
+{
+    if (options.camera != "auto") {
+        return CameraSelection{parseIntValue(options.camera, "--camera"), false, false};
+    }
+
+    const std::vector<CameraCandidate> candidates = scanCameraCandidates(options.scan_max);
+    const int index = choosePreferredCameraIndex(candidates);
+    bool likely_external = false;
+
+    for (const CameraCandidate& candidate : candidates) {
+        if (candidate.index == index) {
+            likely_external = candidate.likely_external;
+            break;
+        }
+    }
+
+    return CameraSelection{index, true, likely_external};
 }
 
 DetectionResult selectRightmostDetection(const std::vector<DetectionResult>& detections)
@@ -373,8 +451,10 @@ void drawOverlay(cv::Mat& frame, const FrameMetrics& metrics, const std::vector<
         cv::LINE_8);
 }
 
-int findCameraIndex(int scan_max)
+std::vector<CameraCandidate> scanCameraCandidates(int scan_max)
 {
+    std::vector<CameraCandidate> candidates;
+
     for (int index = 0; index <= scan_max; ++index) {
         cv::VideoCapture capture;
         if (!capture.open(index)) {
@@ -382,12 +462,45 @@ int findCameraIndex(int scan_max)
         }
 
         if (readValidFrame(capture)) {
+            candidates.push_back(CameraCandidate{index, true, isLikelyExternalCameraIndex(index)});
             capture.release();
-            return index;
+        } else {
+            capture.release();
         }
     }
 
-    return -1;
+    return candidates;
+}
+
+int choosePreferredCameraIndex(const std::vector<CameraCandidate>& candidates)
+{
+    int first_readable = -1;
+    int first_external = -1;
+
+    for (const CameraCandidate& candidate : candidates) {
+        if (!candidate.readable) {
+            continue;
+        }
+
+        if (first_readable < 0 || candidate.index < first_readable) {
+            first_readable = candidate.index;
+        }
+
+        if (candidate.likely_external && (first_external < 0 || candidate.index < first_external)) {
+            first_external = candidate.index;
+        }
+    }
+
+    if (first_external >= 0) {
+        return first_external;
+    }
+
+    return first_readable;
+}
+
+int findCameraIndex(int scan_max)
+{
+    return choosePreferredCameraIndex(scanCameraCandidates(scan_max));
 }
 
 int runBlueBallDetector(int argc, char** argv)
@@ -401,14 +514,16 @@ int runBlueBallDetector(int argc, char** argv)
         return 2;
     }
 
-    int camera_index = -1;
+    CameraSelection camera_selection;
     try {
-        camera_index = resolveCameraIndex(options);
+        camera_selection = resolveCameraSelection(options);
     } catch (const std::exception& error) {
         std::cerr << "Error: " << error.what() << "\n";
         printUsage(argv[0]);
         return 2;
     }
+
+    const int camera_index = camera_selection.index;
 
     if (camera_index < 0) {
         std::cerr << "Error: no available camera found in range 0-" << options.scan_max << "\n";
@@ -424,7 +539,19 @@ int runBlueBallDetector(int argc, char** argv)
     capture.set(cv::CAP_PROP_FRAME_WIDTH, options.width);
     capture.set(cv::CAP_PROP_FRAME_HEIGHT, options.height);
 
-    std::cerr << "Using camera index " << camera_index << "\n";
+    std::cerr << "Using camera index " << camera_index;
+    if (camera_selection.automatic) {
+        std::cerr << " (auto";
+        if (camera_selection.likely_external) {
+            std::cerr << ", external preferred";
+        } else {
+            std::cerr << ", fallback";
+        }
+        std::cerr << ")";
+    } else {
+        std::cerr << " (manual)";
+    }
+    std::cerr << "\n";
 
     cv::Mat frame;
     DetectionBuffers detection_buffers;

@@ -33,6 +33,12 @@ struct FrameMetrics {
     double distance;
 };
 
+struct CameraCandidate {
+    int index;
+    bool readable;
+    bool likely_external;
+};
+
 DetectionResult detectBlueBall(const cv::Mat& frame, const HSVRange& hsv, double min_area);
 
 std::vector<DetectionResult> detectBlueBalls(const cv::Mat& frame, const HSVRange& hsv, double min_area);
@@ -44,6 +50,10 @@ std::string formatMetricsCsv(const FrameMetrics& metrics);
 void drawOverlay(cv::Mat& frame, const FrameMetrics& metrics);
 
 void drawOverlay(cv::Mat& frame, const FrameMetrics& metrics, const std::vector<DetectionResult>& detections);
+
+std::vector<CameraCandidate> scanCameraCandidates(int scan_max);
+
+int choosePreferredCameraIndex(const std::vector<CameraCandidate>& candidates);
 
 int findCameraIndex(int scan_max);
 
