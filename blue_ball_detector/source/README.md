@@ -38,6 +38,14 @@ The preview marks the frame center as `C(x,y)`, the detected blue ball center as
 
 If multiple blue balls are visible, the preview marks all detected blue balls. The rightmost blue ball is highlighted and is the one used for CSV output.
 
+To also mark the warehouse cell that contains each blue ball, enable grid detection and provide the fixed grid size:
+
+```powershell
+D:\RDK_X5\blue_ball_detector\bin\blue_ball_detector.exe --camera auto --display --grid-enable --grid-rows 3 --grid-cols 4
+```
+
+The preview detects visible warehouse grid lines, draws the blue-ball cells with yellow boxes, and labels cell numbers from left to right, top to bottom. If grid detection fails for a frame, the blue-ball overlay and CSV output continue normally and no wrong cell box is drawn.
+
 Run without `--display` for pure CSV output:
 
 ```powershell
@@ -118,6 +126,14 @@ Other useful options:
 ./build/blue_ball_detector --width 640 --height 480 --min-area 300 --rate-ms 100 --display
 ```
 
+Warehouse grid overlay options:
+
+```bash
+./build/blue_ball_detector --display --grid-enable --grid-rows 3 --grid-cols 4
+```
+
+`--grid-enable` only affects the preview window. The CSV protocol remains the same 9 fields.
+
 For higher processing/output frequency, remove the artificial delay:
 
 ```bash
@@ -126,7 +142,7 @@ For higher processing/output frequency, remove the artificial delay:
 
 ## Tests
 
-The test executable uses synthetic images to verify multi-ball detection, rightmost-ball selection, center offset, distance, overlay drawing, and CSV formatting:
+The test executable uses synthetic images to verify multi-ball detection, rightmost-ball selection, center offset, distance, overlay drawing, warehouse grid cell numbering, and CSV formatting:
 
 ```bash
 cmake --build build --target blue_ball_detector_tests

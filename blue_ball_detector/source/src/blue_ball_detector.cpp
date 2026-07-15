@@ -32,6 +32,7 @@ struct ProgramOptions {
     double min_area = 300.0;
     int rate_ms = 100;
     bool display = false;
+    GridConfig grid{false, 0, 0};
 };
 
 constexpr const char* kDisplayWindowName = "Blue Ball Detector";
@@ -109,6 +110,9 @@ void printUsage(const char* program)
         << "  --min-area N      Minimum contour area. Default: 300\n"
         << "  --rate-ms N       Output interval in milliseconds. Default: 100\n"
         << "  --display         Show annotated camera preview for PC testing\n"
+        << "  --grid-enable     Detect warehouse grid and draw blue-ball cells in display mode\n"
+        << "  --grid-rows N     Warehouse grid row count. Required with --grid-enable\n"
+        << "  --grid-cols N     Warehouse grid column count. Required with --grid-enable\n"
         << "  --help            Show this help message\n";
 }
 
@@ -148,6 +152,12 @@ ProgramOptions parseOptions(int argc, char** argv)
             options.rate_ms = parseIntValue(takeValue(i, argc, argv, arg, "--rate-ms"), "--rate-ms");
         } else if (arg == "--display") {
             options.display = true;
+        } else if (arg == "--grid-enable") {
+            options.grid.enabled = true;
+        } else if (isFlag(arg, "--grid-rows")) {
+            options.grid.rows = parseIntValue(takeValue(i, argc, argv, arg, "--grid-rows"), "--grid-rows");
+        } else if (isFlag(arg, "--grid-cols")) {
+            options.grid.cols = parseIntValue(takeValue(i, argc, argv, arg, "--grid-cols"), "--grid-cols");
         } else {
             throw std::invalid_argument("unknown option: " + arg);
         }
@@ -164,6 +174,12 @@ ProgramOptions parseOptions(int argc, char** argv)
     }
     if (options.rate_ms < 0) {
         throw std::invalid_argument("--rate-ms must be >= 0");
+    }
+    if (options.grid.enabled && (options.grid.rows <= 0 || options.grid.cols <= 0)) {
+        throw std::invalid_argument("--grid-rows and --grid-cols must be > 0 when --grid-enable is set");
+    }
+    if (!options.grid.enabled && (options.grid.rows < 0 || options.grid.cols < 0)) {
+        throw std::invalid_argument("--grid-rows and --grid-cols must be >= 0");
     }
 
     return options;
@@ -278,6 +294,106 @@ DetectionResult selectRightmostDetection(const std::vector<DetectionResult>& det
     return selected;
 }
 
+std::vector<int> clusterLinePositions(std::vector<int> positions, int tolerance)
+{
+    std::vector<int> clustered;
+    if (positions.empty()) {
+        return clustered;
+    }
+
+    std::sort(positions.begin(), positions.end());
+
+    int sum = positions.front();
+    int count = 1;
+    int current_center = positions.front();
+
+    for (std::size_t index = 1; index < positions.size(); ++index) {
+        const int position = positions[index];
+        if (std::abs(position - current_center) <= tolerance) {
+            sum += position;
+            ++count;
+            current_center = static_cast<int>(std::lround(static_cast<double>(sum) / count));
+        } else {
+            clustered.push_back(current_center);
+            sum = position;
+            count = 1;
+            current_center = position;
+        }
+    }
+
+    clustered.push_back(current_center);
+    return clustered;
+}
+
+std::vector<int> chooseGridLinePositions(const std::vector<int>& clustered, int expected_count)
+{
+    if (expected_count <= 1 || static_cast<int>(clustered.size()) < expected_count) {
+        return {};
+    }
+
+    if (static_cast<int>(clustered.size()) == expected_count) {
+        return clustered;
+    }
+
+    std::vector<int> selected;
+    selected.reserve(static_cast<std::size_t>(expected_count));
+
+    const int first = clustered.front();
+    const int last = clustered.back();
+    for (int index = 0; index < expected_count; ++index) {
+        const double expected = first + (last - first) * (static_cast<double>(index) / (expected_count - 1));
+        const auto closest = std::min_element(
+            clustered.begin(),
+            clustered.end(),
+            [expected](int left, int right) {
+                return std::abs(left - expected) < std::abs(right - expected);
+            });
+        selected.push_back(*closest);
+    }
+
+    std::sort(selected.begin(), selected.end());
+    selected.erase(std::unique(selected.begin(), selected.end()), selected.end());
+    if (static_cast<int>(selected.size()) != expected_count) {
+        return {};
+    }
+
+    return selected;
+}
+
+GridDetectionResult buildGridCells(const std::vector<int>& x_lines, const std::vector<int>& y_lines, const GridConfig& config)
+{
+    GridDetectionResult result{false, {}};
+
+    if (static_cast<int>(x_lines.size()) != config.cols + 1 ||
+        static_cast<int>(y_lines.size()) != config.rows + 1) {
+        return result;
+    }
+
+    result.found = true;
+    result.cells.reserve(static_cast<std::size_t>(config.rows * config.cols));
+
+    for (int row = 0; row < config.rows; ++row) {
+        for (int col = 0; col < config.cols; ++col) {
+            const float left = static_cast<float>(x_lines[col]);
+            const float right = static_cast<float>(x_lines[col + 1]);
+            const float top = static_cast<float>(y_lines[row]);
+            const float bottom = static_cast<float>(y_lines[row + 1]);
+
+            result.cells.push_back(GridCell{
+                row,
+                col,
+                row * config.cols + col + 1,
+                std::vector<cv::Point2f>{
+                    cv::Point2f(left, top),
+                    cv::Point2f(right, top),
+                    cv::Point2f(right, bottom),
+                    cv::Point2f(left, bottom)}});
+        }
+    }
+
+    return result;
+}
+
 std::vector<DetectionResult> detectBlueBallsWithBuffers(
     const cv::Mat& frame,
     const HSVRange& hsv,
@@ -355,6 +471,70 @@ std::vector<DetectionResult> detectBlueBalls(const cv::Mat& frame, const HSVRang
     return detectBlueBallsWithBuffers(frame, hsv, min_area, buffers);
 }
 
+GridDetectionResult detectWarehouseGrid(const cv::Mat& frame, const GridConfig& config)
+{
+    if (!config.enabled || config.rows <= 0 || config.cols <= 0 || frame.empty()) {
+        return GridDetectionResult{false, {}};
+    }
+
+    cv::Mat gray;
+    cv::Mat blurred;
+    cv::Mat edges;
+
+    cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+    cv::GaussianBlur(gray, blurred, cv::Size(3, 3), 0.0);
+    cv::Canny(blurred, edges, 50.0, 150.0, 3);
+
+    std::vector<cv::Vec4i> lines;
+    const int min_dimension = std::min(frame.cols, frame.rows);
+    const int min_line_length = std::max(20, min_dimension / 5);
+    cv::HoughLinesP(edges, lines, 1.0, CV_PI / 180.0, 40, min_line_length, 12.0);
+
+    std::vector<int> x_positions;
+    std::vector<int> y_positions;
+    x_positions.reserve(lines.size());
+    y_positions.reserve(lines.size());
+
+    for (const cv::Vec4i& line : lines) {
+        const int x1 = line[0];
+        const int y1 = line[1];
+        const int x2 = line[2];
+        const int y2 = line[3];
+        const int dx = std::abs(x2 - x1);
+        const int dy = std::abs(y2 - y1);
+
+        if (dy >= min_line_length && dx <= std::max(3, dy / 5)) {
+            x_positions.push_back((x1 + x2) / 2);
+        } else if (dx >= min_line_length && dy <= std::max(3, dx / 5)) {
+            y_positions.push_back((y1 + y2) / 2);
+        }
+    }
+
+    const int x_tolerance = std::max(6, frame.cols / std::max(24, config.cols * 8));
+    const int y_tolerance = std::max(6, frame.rows / std::max(24, config.rows * 8));
+    const std::vector<int> clustered_x = clusterLinePositions(x_positions, x_tolerance);
+    const std::vector<int> clustered_y = clusterLinePositions(y_positions, y_tolerance);
+    const std::vector<int> x_lines = chooseGridLinePositions(clustered_x, config.cols + 1);
+    const std::vector<int> y_lines = chooseGridLinePositions(clustered_y, config.rows + 1);
+
+    return buildGridCells(x_lines, y_lines, config);
+}
+
+const GridCell* findContainingCell(const std::vector<GridCell>& cells, cv::Point2f point)
+{
+    for (const GridCell& cell : cells) {
+        if (cell.corners.size() < 3) {
+            continue;
+        }
+
+        if (cv::pointPolygonTest(cell.corners, point, false) >= 0.0) {
+            return &cell;
+        }
+    }
+
+    return nullptr;
+}
+
 FrameMetrics computeFrameMetrics(const cv::Size& frame_size, const DetectionResult& detection)
 {
     const int center_x = frame_size.width / 2;
@@ -396,6 +576,15 @@ void drawOverlay(cv::Mat& frame, const FrameMetrics& metrics)
 
 void drawOverlay(cv::Mat& frame, const FrameMetrics& metrics, const std::vector<DetectionResult>& detections)
 {
+    drawOverlay(frame, metrics, detections, GridDetectionResult{false, {}});
+}
+
+void drawOverlay(
+    cv::Mat& frame,
+    const FrameMetrics& metrics,
+    const std::vector<DetectionResult>& detections,
+    const GridDetectionResult& grid)
+{
     if (frame.empty()) {
         return;
     }
@@ -405,6 +594,50 @@ void drawOverlay(cv::Mat& frame, const FrameMetrics& metrics, const std::vector<
     const cv::Scalar ball_color(0, 0, 255);
     const cv::Scalar other_ball_color(255, 255, 0);
     const cv::Scalar line_color(0, 255, 255);
+    const cv::Scalar grid_color(0, 255, 255);
+
+    if (grid.found) {
+        std::vector<int> drawn_cell_indices;
+        for (const DetectionResult& detection : detections) {
+            if (!detection.found) {
+                continue;
+            }
+
+            const GridCell* cell = findContainingCell(
+                grid.cells,
+                cv::Point2f(static_cast<float>(detection.x), static_cast<float>(detection.y)));
+            if (cell == nullptr) {
+                continue;
+            }
+
+            if (std::find(drawn_cell_indices.begin(), drawn_cell_indices.end(), cell->index) !=
+                drawn_cell_indices.end()) {
+                continue;
+            }
+            drawn_cell_indices.push_back(cell->index);
+
+            std::vector<cv::Point> corners;
+            corners.reserve(cell->corners.size());
+            for (const cv::Point2f& corner : cell->corners) {
+                corners.emplace_back(
+                    static_cast<int>(std::lround(corner.x)),
+                    static_cast<int>(std::lround(corner.y)));
+            }
+
+            if (corners.size() >= 3) {
+                cv::polylines(frame, corners, true, grid_color, 2, cv::LINE_8);
+                cv::putText(
+                    frame,
+                    std::to_string(cell->index),
+                    corners.front() + cv::Point(6, 18),
+                    cv::FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    grid_color,
+                    2,
+                    cv::LINE_8);
+            }
+        }
+    }
 
     for (const DetectionResult& detection : detections) {
         if (!detection.found || (metrics.found && detection.x == metrics.ball_x && detection.y == metrics.ball_y)) {
@@ -569,7 +802,10 @@ int runBlueBallDetector(int argc, char** argv)
         std::cout << formatMetricsCsv(metrics) << std::endl;
 
         if (options.display) {
-            drawOverlay(frame, metrics, detections);
+            const GridDetectionResult grid = options.grid.enabled
+                ? detectWarehouseGrid(frame, options.grid)
+                : GridDetectionResult{false, {}};
+            drawOverlay(frame, metrics, detections, grid);
             cv::imshow(kDisplayWindowName, frame);
 
             const int key = cv::waitKey(1);

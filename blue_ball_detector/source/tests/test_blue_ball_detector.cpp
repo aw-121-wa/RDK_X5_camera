@@ -217,6 +217,94 @@ void test_draw_overlay_marks_all_detected_balls()
     assert(selected_ball_pixel[1] < 50);
 }
 
+void drawSyntheticGrid(cv::Mat& frame, int rows, int cols)
+{
+    const int width = frame.cols;
+    const int height = frame.rows;
+
+    for (int col = 0; col <= cols; ++col) {
+        const int x = (width - 1) * col / cols;
+        cv::line(frame, cv::Point(x, 0), cv::Point(x, height - 1), cv::Scalar(255, 255, 255), 3);
+    }
+
+    for (int row = 0; row <= rows; ++row) {
+        const int y = (height - 1) * row / rows;
+        cv::line(frame, cv::Point(0, y), cv::Point(width - 1, y), cv::Scalar(255, 255, 255), 3);
+    }
+}
+
+void test_detects_grid_cells_in_reading_order()
+{
+    cv::Mat frame(240, 320, CV_8UC3, cv::Scalar(0, 0, 0));
+    drawSyntheticGrid(frame, 2, 3);
+
+    const GridDetectionResult grid = detectWarehouseGrid(frame, GridConfig{true, 2, 3});
+
+    assert(grid.found);
+    assert(grid.cells.size() == 6);
+    assert(grid.cells[0].row == 0);
+    assert(grid.cells[0].col == 0);
+    assert(grid.cells[0].index == 1);
+    assert(grid.cells[2].row == 0);
+    assert(grid.cells[2].col == 2);
+    assert(grid.cells[2].index == 3);
+    assert(grid.cells[3].row == 1);
+    assert(grid.cells[3].col == 0);
+    assert(grid.cells[3].index == 4);
+    assert(grid.cells[5].row == 1);
+    assert(grid.cells[5].col == 2);
+    assert(grid.cells[5].index == 6);
+}
+
+void test_finds_cell_containing_ball_center()
+{
+    cv::Mat frame(240, 320, CV_8UC3, cv::Scalar(0, 0, 0));
+    drawSyntheticGrid(frame, 2, 3);
+
+    const GridDetectionResult grid = detectWarehouseGrid(frame, GridConfig{true, 2, 3});
+    const GridCell* cell = findContainingCell(grid.cells, cv::Point2f(170.0F, 60.0F));
+
+    assert(cell != nullptr);
+    assert(cell->row == 0);
+    assert(cell->col == 1);
+    assert(cell->index == 2);
+}
+
+void test_draw_overlay_marks_blue_ball_cell_with_yellow_box()
+{
+    cv::Mat frame(100, 120, CV_8UC3, cv::Scalar(0, 0, 0));
+    const GridDetectionResult grid{
+        true,
+        std::vector<GridCell>{
+            GridCell{0, 0, 1, std::vector<cv::Point2f>{
+                cv::Point2f(0.0F, 0.0F),
+                cv::Point2f(59.0F, 0.0F),
+                cv::Point2f(59.0F, 49.0F),
+                cv::Point2f(0.0F, 49.0F)}},
+            GridCell{0, 1, 2, std::vector<cv::Point2f>{
+                cv::Point2f(60.0F, 0.0F),
+                cv::Point2f(119.0F, 0.0F),
+                cv::Point2f(119.0F, 49.0F),
+                cv::Point2f(60.0F, 49.0F)}}}};
+    const FrameMetrics metrics{true, 80, 20, 60, 50, 20, -30, std::sqrt(1300.0)};
+    const std::vector<DetectionResult> detections{DetectionResult{true, 80, 20, 900.0}};
+
+    drawOverlay(frame, metrics, detections, grid);
+
+    const cv::Vec3b yellow_border_pixel = frame.at<cv::Vec3b>(0, 60);
+    assert(yellow_border_pixel[0] < 50);
+    assert(yellow_border_pixel[1] > 200);
+    assert(yellow_border_pixel[2] > 200);
+}
+
+void test_grid_detection_fails_for_empty_frame()
+{
+    const GridDetectionResult grid = detectWarehouseGrid(cv::Mat(), GridConfig{true, 2, 3});
+
+    assert(!grid.found);
+    assert(grid.cells.empty());
+}
+
 void test_camera_selection_uses_only_available_camera()
 {
     const std::vector<CameraCandidate> candidates{
@@ -281,6 +369,10 @@ int main()
     test_draw_overlay_marks_center_and_ball();
     test_draw_overlay_marks_center_when_ball_missing();
     test_draw_overlay_marks_all_detected_balls();
+    test_detects_grid_cells_in_reading_order();
+    test_finds_cell_containing_ball_center();
+    test_draw_overlay_marks_blue_ball_cell_with_yellow_box();
+    test_grid_detection_fails_for_empty_frame();
     test_camera_selection_uses_only_available_camera();
     test_camera_selection_prefers_external_over_index_zero();
     test_camera_selection_uses_lowest_external_index();

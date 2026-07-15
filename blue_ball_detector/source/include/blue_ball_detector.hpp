@@ -39,9 +39,31 @@ struct CameraCandidate {
     bool likely_external;
 };
 
+struct GridConfig {
+    bool enabled;
+    int rows;
+    int cols;
+};
+
+struct GridCell {
+    int row;
+    int col;
+    int index;
+    std::vector<cv::Point2f> corners;
+};
+
+struct GridDetectionResult {
+    bool found;
+    std::vector<GridCell> cells;
+};
+
 DetectionResult detectBlueBall(const cv::Mat& frame, const HSVRange& hsv, double min_area);
 
 std::vector<DetectionResult> detectBlueBalls(const cv::Mat& frame, const HSVRange& hsv, double min_area);
+
+GridDetectionResult detectWarehouseGrid(const cv::Mat& frame, const GridConfig& config);
+
+const GridCell* findContainingCell(const std::vector<GridCell>& cells, cv::Point2f point);
 
 FrameMetrics computeFrameMetrics(const cv::Size& frame_size, const DetectionResult& detection);
 
@@ -50,6 +72,12 @@ std::string formatMetricsCsv(const FrameMetrics& metrics);
 void drawOverlay(cv::Mat& frame, const FrameMetrics& metrics);
 
 void drawOverlay(cv::Mat& frame, const FrameMetrics& metrics, const std::vector<DetectionResult>& detections);
+
+void drawOverlay(
+    cv::Mat& frame,
+    const FrameMetrics& metrics,
+    const std::vector<DetectionResult>& detections,
+    const GridDetectionResult& grid);
 
 std::vector<CameraCandidate> scanCameraCandidates(int scan_max);
 
