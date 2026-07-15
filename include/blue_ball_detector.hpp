@@ -1,0 +1,45 @@
+#ifndef BLUE_BALL_DETECTOR_HPP
+#define BLUE_BALL_DETECTOR_HPP
+
+#include <string>
+
+#include <opencv2/core.hpp>
+
+struct HSVRange {
+    int h_min;
+    int h_max;
+    int s_min;
+    int s_max;
+    int v_min;
+    int v_max;
+};
+
+struct DetectionResult {
+    bool found;
+    int x;
+    int y;
+    double area;
+};
+
+struct FrameMetrics {
+    bool found;
+    int ball_x;
+    int ball_y;
+    int center_x;
+    int center_y;
+    int dx;
+    int dy;
+    double distance;
+};
+
+DetectionResult detectBlueBall(const cv::Mat& frame, const HSVRange& hsv, double min_area);
+
+FrameMetrics computeFrameMetrics(const cv::Size& frame_size, const DetectionResult& detection);
+
+std::string formatMetricsCsv(const FrameMetrics& metrics);
+
+int findCameraIndex(int scan_max);
+
+int runBlueBallDetector(int argc, char** argv);
+
+#endif
