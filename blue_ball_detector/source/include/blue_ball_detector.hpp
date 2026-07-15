@@ -40,9 +40,11 @@ struct CameraCandidate {
 };
 
 struct GridConfig {
-    bool enabled;
-    int rows;
-    int cols;
+    bool enabled = false;
+    int rows = 0;
+    int cols = 0;
+    double cell_aspect = 4.0 / 3.0;
+    double aspect_tolerance = 0.35;
 };
 
 struct GridCell {
@@ -58,8 +60,9 @@ struct GridDetectionResult {
 };
 
 struct GridTrackerConfig {
-    int cache_frames;
-    double smoothing_alpha;
+    int cache_frames = 15;
+    double smoothing_alpha = 0.35;
+    double jitter_hold_threshold = 5.0;
 };
 
 struct GridTrackerState {

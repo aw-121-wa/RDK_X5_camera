@@ -12,7 +12,7 @@ namespace {
 
 HSVRange defaultBlueRange()
 {
-    return HSVRange{90, 130, 80, 255, 50, 255};
+    return HSVRange{90, 130, 60, 255, 40, 255};
 }
 
 void test_detects_blue_circle_center()
@@ -66,6 +66,18 @@ void test_detects_all_blue_regions()
     assert(std::abs(results[0].x - 110) <= 1);
     assert(std::abs(results[1].x - 310) <= 1);
     assert(std::abs(results[2].x - 510) <= 1);
+}
+
+void test_detects_less_saturated_small_blue_ball()
+{
+    cv::Mat frame(160, 200, CV_8UC3, cv::Scalar(0, 0, 0));
+    cv::circle(frame, cv::Point(90, 70), 8, cv::Scalar(150, 110, 110), -1);
+
+    const DetectionResult result = detectBlueBall(frame, defaultBlueRange(), 100.0);
+
+    assert(result.found);
+    assert(std::abs(result.x - 90) <= 1);
+    assert(std::abs(result.y - 70) <= 1);
 }
 
 void test_selects_rightmost_blue_region_not_largest()
@@ -235,7 +247,7 @@ void drawSyntheticGrid(cv::Mat& frame, int rows, int cols)
 
 void test_detects_grid_cells_in_reading_order()
 {
-    cv::Mat frame(240, 320, CV_8UC3, cv::Scalar(0, 0, 0));
+    cv::Mat frame(120, 240, CV_8UC3, cv::Scalar(0, 0, 0));
     drawSyntheticGrid(frame, 2, 3);
 
     const GridDetectionResult grid = detectWarehouseGrid(frame, GridConfig{true, 2, 3});
@@ -258,11 +270,11 @@ void test_detects_grid_cells_in_reading_order()
 
 void test_finds_cell_containing_ball_center()
 {
-    cv::Mat frame(240, 320, CV_8UC3, cv::Scalar(0, 0, 0));
+    cv::Mat frame(120, 240, CV_8UC3, cv::Scalar(0, 0, 0));
     drawSyntheticGrid(frame, 2, 3);
 
     const GridDetectionResult grid = detectWarehouseGrid(frame, GridConfig{true, 2, 3});
-    const GridCell* cell = findContainingCell(grid.cells, cv::Point2f(170.0F, 60.0F));
+    const GridCell* cell = findContainingCell(grid.cells, cv::Point2f(120.0F, 30.0F));
 
     assert(cell != nullptr);
     assert(cell->row == 0);
@@ -388,15 +400,97 @@ void test_grid_tracker_smooths_successive_grid_positions()
 
 void test_completes_grid_from_outer_bounds_when_inner_lines_are_missing()
 {
-    const std::vector<int> x_lines{0, 100};
+    const std::vector<int> x_lines{0, 133};
     const std::vector<int> y_lines{0, 100};
 
     const GridDetectionResult grid = completeGridFromBounds(x_lines, y_lines, GridConfig{true, 2, 2});
 
     assert(grid.found);
     assert(grid.cells.size() == 4);
-    assert(std::abs(grid.cells[1].corners[0].x - 50.0F) < 0.001F);
+    assert(std::abs(grid.cells[1].corners[0].x - 67.0F) < 0.001F);
     assert(grid.cells[3].index == 4);
+}
+
+void test_grid_config_defaults_to_four_to_three_cell_aspect()
+{
+    const GridConfig config{true, 2, 3};
+
+    assert(std::abs(config.cell_aspect - (4.0 / 3.0)) < 0.001);
+    assert(std::abs(config.aspect_tolerance - 0.35) < 0.001);
+}
+
+void test_grid_tracker_keeps_previous_grid_for_small_jitter()
+{
+    GridTrackerState state;
+    const GridTrackerConfig config{15, 0.5, 5.0};
+    updateGridTracker(makeTwoByTwoGrid(0.0F), state, config);
+
+    const GridDetectionResult tracked = updateGridTracker(makeTwoByTwoGrid(2.0F), state, config);
+
+    assert(tracked.found);
+    assert(std::abs(tracked.cells[0].corners[0].x - 0.0F) < 0.001F);
+    assert(state.missed_frames == 0);
+}
+
+void test_completes_grid_from_bounds_when_aspect_matches_cell_ratio()
+{
+    const GridConfig config{true, 2, 3, 2.0, 0.10};
+    const std::vector<int> x_lines{0, 300};
+    const std::vector<int> y_lines{0, 100};
+
+    const GridDetectionResult grid = completeGridFromBounds(x_lines, y_lines, config);
+
+    assert(grid.found);
+    assert(grid.cells.size() == 6);
+    assert(std::abs(grid.cells[1].corners[0].x - 100.0F) < 0.001F);
+    assert(std::abs(grid.cells[5].corners[2].x - 300.0F) < 0.001F);
+    assert(std::abs(grid.cells[5].corners[2].y - 100.0F) < 0.001F);
+}
+
+void test_rejects_grid_bounds_when_aspect_is_too_far_from_cell_ratio()
+{
+    const GridConfig config{true, 2, 3, 2.0, 0.10};
+    const std::vector<int> x_lines{0, 100};
+    const std::vector<int> y_lines{0, 100};
+
+    const GridDetectionResult grid = completeGridFromBounds(x_lines, y_lines, config);
+
+    assert(!grid.found);
+    assert(grid.cells.empty());
+}
+
+void test_chooses_grid_bounds_with_best_matching_aspect()
+{
+    const GridConfig config{true, 2, 3, 2.0, 0.20};
+    const std::vector<int> x_lines{0, 300, 320};
+    const std::vector<int> y_lines{0, 100};
+
+    const GridDetectionResult grid = completeGridFromBounds(x_lines, y_lines, config);
+
+    assert(grid.found);
+    assert(std::abs(grid.cells[5].corners[2].x - 300.0F) < 0.001F);
+}
+
+void test_run_rejects_invalid_cell_aspect_argument()
+{
+    const char* args[] = {"blue_ball_detector", "--cell-aspect", "0"};
+    char* argv[] = {
+        const_cast<char*>(args[0]),
+        const_cast<char*>(args[1]),
+        const_cast<char*>(args[2])};
+
+    assert(runBlueBallDetector(3, argv) == 2);
+}
+
+void test_run_rejects_invalid_grid_aspect_tolerance_argument()
+{
+    const char* args[] = {"blue_ball_detector", "--grid-aspect-tolerance", "0"};
+    char* argv[] = {
+        const_cast<char*>(args[0]),
+        const_cast<char*>(args[1]),
+        const_cast<char*>(args[2])};
+
+    assert(runBlueBallDetector(3, argv) == 2);
 }
 
 void test_camera_scan_order_prioritizes_common_external_camera_on_windows()
@@ -465,6 +559,7 @@ int main()
     test_missing_blue_circle_returns_not_found();
     test_detects_blue_region_when_largest_is_rightmost();
     test_detects_all_blue_regions();
+    test_detects_less_saturated_small_blue_ball();
     test_selects_rightmost_blue_region_not_largest();
     test_selects_larger_region_when_rightmost_x_ties();
     test_computes_frame_metrics_for_found_ball();
@@ -483,6 +578,13 @@ int main()
     test_grid_tracker_expires_cached_grid_after_limit();
     test_grid_tracker_smooths_successive_grid_positions();
     test_completes_grid_from_outer_bounds_when_inner_lines_are_missing();
+    test_grid_config_defaults_to_four_to_three_cell_aspect();
+    test_grid_tracker_keeps_previous_grid_for_small_jitter();
+    test_completes_grid_from_bounds_when_aspect_matches_cell_ratio();
+    test_rejects_grid_bounds_when_aspect_is_too_far_from_cell_ratio();
+    test_chooses_grid_bounds_with_best_matching_aspect();
+    test_run_rejects_invalid_cell_aspect_argument();
+    test_run_rejects_invalid_grid_aspect_tolerance_argument();
     test_camera_scan_order_prioritizes_common_external_camera_on_windows();
     test_camera_selection_uses_only_available_camera();
     test_camera_selection_prefers_external_over_index_zero();

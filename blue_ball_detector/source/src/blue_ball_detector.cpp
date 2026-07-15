@@ -28,8 +28,8 @@ struct ProgramOptions {
     int scan_max = 9;
     int width = 640;
     int height = 480;
-    HSVRange hsv{90, 130, 80, 255, 50, 255};
-    double min_area = 300.0;
+    HSVRange hsv{90, 130, 60, 255, 40, 255};
+    double min_area = 150.0;
     int rate_ms = 100;
     bool display = false;
     GridConfig grid{false, 0, 0};
@@ -44,13 +44,24 @@ struct DetectionBuffers {
     cv::Mat labels;
     cv::Mat stats;
     cv::Mat centroids;
-    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5));
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
 };
 
 struct CameraSelection {
     int index = -1;
     bool automatic = false;
     bool likely_external = false;
+};
+
+struct GridBoundsCandidate {
+    bool found = false;
+    int left = 0;
+    int right = 0;
+    int top = 0;
+    int bottom = 0;
+    double ratio_error = std::numeric_limits<double>::infinity();
+    int support_count = 0;
+    double area = 0.0;
 };
 
 bool isFlag(const std::string& arg, const std::string& flag)
@@ -76,7 +87,12 @@ std::string takeValue(int& index, int argc, char** argv, const std::string& arg,
 int parseIntValue(const std::string& value, const std::string& flag)
 {
     std::size_t consumed = 0;
-    const int parsed = std::stoi(value, &consumed);
+    int parsed = 0;
+    try {
+        parsed = std::stoi(value, &consumed);
+    } catch (const std::exception&) {
+        throw std::invalid_argument("invalid integer for " + flag + ": " + value);
+    }
     if (consumed != value.size()) {
         throw std::invalid_argument("invalid integer for " + flag + ": " + value);
     }
@@ -104,17 +120,19 @@ void printUsage(const char* program)
         << "  --height N        Capture height. Default: 480\n"
         << "  --h-min N         HSV hue minimum. Default: 90\n"
         << "  --h-max N         HSV hue maximum. Default: 130\n"
-        << "  --s-min N         HSV saturation minimum. Default: 80\n"
+        << "  --s-min N         HSV saturation minimum. Default: 60\n"
         << "  --s-max N         HSV saturation maximum. Default: 255\n"
-        << "  --v-min N         HSV value minimum. Default: 50\n"
+        << "  --v-min N         HSV value minimum. Default: 40\n"
         << "  --v-max N         HSV value maximum. Default: 255\n"
-        << "  --min-area N      Minimum contour area. Default: 300\n"
+        << "  --min-area N      Minimum contour area. Default: 150\n"
         << "  --rate-ms N       Output interval in milliseconds. Default: 100\n"
         << "  --display         Show annotated camera preview for PC testing\n"
         << "  --grid-enable     Detect warehouse grid and draw blue-ball cells in display mode\n"
         << "  --grid-rows N     Warehouse grid row count. Required with --grid-enable\n"
         << "  --grid-cols N     Warehouse grid column count. Required with --grid-enable\n"
         << "  --grid-cache-frames N  Reuse last valid grid for N missed frames. Default: 15\n"
+        << "  --cell-aspect N   Physical cell width/height ratio. Default: 1.333333\n"
+        << "  --grid-aspect-tolerance N  Accepted grid aspect error ratio. Default: 0.35\n"
         << "  --help            Show this help message\n";
 }
 
@@ -163,6 +181,12 @@ ProgramOptions parseOptions(int argc, char** argv)
         } else if (isFlag(arg, "--grid-cache-frames")) {
             options.grid_cache_frames =
                 parseIntValue(takeValue(i, argc, argv, arg, "--grid-cache-frames"), "--grid-cache-frames");
+        } else if (isFlag(arg, "--cell-aspect")) {
+            options.grid.cell_aspect = parseDoubleValue(takeValue(i, argc, argv, arg, "--cell-aspect"), "--cell-aspect");
+        } else if (isFlag(arg, "--grid-aspect-tolerance")) {
+            options.grid.aspect_tolerance = parseDoubleValue(
+                takeValue(i, argc, argv, arg, "--grid-aspect-tolerance"),
+                "--grid-aspect-tolerance");
         } else {
             throw std::invalid_argument("unknown option: " + arg);
         }
@@ -188,6 +212,12 @@ ProgramOptions parseOptions(int argc, char** argv)
     }
     if (options.grid_cache_frames < 0) {
         throw std::invalid_argument("--grid-cache-frames must be >= 0");
+    }
+    if (options.grid.cell_aspect <= 0.0) {
+        throw std::invalid_argument("--cell-aspect must be > 0");
+    }
+    if (options.grid.aspect_tolerance <= 0.0) {
+        throw std::invalid_argument("--grid-aspect-tolerance must be > 0");
     }
 
     return options;
@@ -402,25 +432,151 @@ GridDetectionResult buildGridCells(const std::vector<int>& x_lines, const std::v
     return result;
 }
 
-std::vector<int> fillEvenlySpacedLinesFromBounds(const std::vector<int>& lines, int expected_count)
+std::vector<int> normalizedLinePositions(std::vector<int> lines)
 {
-    if (expected_count <= 1 || lines.size() < 2) {
+    std::sort(lines.begin(), lines.end());
+    lines.erase(std::unique(lines.begin(), lines.end()), lines.end());
+    return lines;
+}
+
+double expectedGridAspect(const GridConfig& config)
+{
+    if (config.rows <= 0 || config.cols <= 0 || config.cell_aspect <= 0.0) {
+        return 0.0;
+    }
+
+    return (static_cast<double>(config.cols) * config.cell_aspect) / static_cast<double>(config.rows);
+}
+
+double gridAspectError(int left, int right, int top, int bottom, const GridConfig& config)
+{
+    const int width = right - left;
+    const int height = bottom - top;
+    const double expected_ratio = expectedGridAspect(config);
+
+    if (width <= 0 || height <= 0 || expected_ratio <= 0.0) {
+        return std::numeric_limits<double>::infinity();
+    }
+
+    const double actual_ratio = static_cast<double>(width) / static_cast<double>(height);
+    return std::abs((actual_ratio / expected_ratio) - 1.0);
+}
+
+int countLinesInBounds(const std::vector<int>& lines, int first, int last)
+{
+    return static_cast<int>(std::count_if(
+        lines.begin(),
+        lines.end(),
+        [first, last](int line) {
+            return line >= first && line <= last;
+        }));
+}
+
+bool isBetterGridBoundsCandidate(const GridBoundsCandidate& candidate, const GridBoundsCandidate& best)
+{
+    if (!best.found) {
+        return true;
+    }
+
+    constexpr double kEpsilon = 1e-9;
+    if (candidate.ratio_error < best.ratio_error - kEpsilon) {
+        return true;
+    }
+    if (candidate.ratio_error > best.ratio_error + kEpsilon) {
+        return false;
+    }
+    if (candidate.support_count != best.support_count) {
+        return candidate.support_count > best.support_count;
+    }
+    return candidate.area > best.area;
+}
+
+GridBoundsCandidate chooseBestGridBoundsCandidate(
+    const std::vector<int>& x_lines,
+    const std::vector<int>& y_lines,
+    const GridConfig& config)
+{
+    const std::vector<int> normalized_x = normalizedLinePositions(x_lines);
+    const std::vector<int> normalized_y = normalizedLinePositions(y_lines);
+    GridBoundsCandidate best;
+
+    if (normalized_x.size() < 2 || normalized_y.size() < 2 || expectedGridAspect(config) <= 0.0) {
+        return best;
+    }
+
+    for (std::size_t left_index = 0; left_index + 1 < normalized_x.size(); ++left_index) {
+        for (std::size_t right_index = left_index + 1; right_index < normalized_x.size(); ++right_index) {
+            const int left = normalized_x[left_index];
+            const int right = normalized_x[right_index];
+
+            for (std::size_t top_index = 0; top_index + 1 < normalized_y.size(); ++top_index) {
+                for (std::size_t bottom_index = top_index + 1; bottom_index < normalized_y.size(); ++bottom_index) {
+                    const int top = normalized_y[top_index];
+                    const int bottom = normalized_y[bottom_index];
+                    const double ratio_error = gridAspectError(left, right, top, bottom, config);
+
+                    if (ratio_error > config.aspect_tolerance) {
+                        continue;
+                    }
+
+                    const double area = static_cast<double>(right - left) * static_cast<double>(bottom - top);
+                    if (area <= 0.0) {
+                        continue;
+                    }
+
+                    const GridBoundsCandidate candidate{
+                        true,
+                        left,
+                        right,
+                        top,
+                        bottom,
+                        ratio_error,
+                        countLinesInBounds(normalized_x, left, right) +
+                            countLinesInBounds(normalized_y, top, bottom),
+                        area};
+
+                    if (isBetterGridBoundsCandidate(candidate, best)) {
+                        best = candidate;
+                    }
+                }
+            }
+        }
+    }
+
+    return best;
+}
+
+std::vector<int> fillEvenlySpacedLinesFromBounds(int first, int last, int expected_count)
+{
+    if (expected_count <= 1 || first == last) {
         return {};
     }
 
-    const auto [min_line, max_line] = std::minmax_element(lines.begin(), lines.end());
-    if (*min_line == *max_line) {
-        return {};
+    if (first > last) {
+        std::swap(first, last);
     }
 
     std::vector<int> filled;
     filled.reserve(static_cast<std::size_t>(expected_count));
     for (int index = 0; index < expected_count; ++index) {
         const double ratio = static_cast<double>(index) / (expected_count - 1);
-        filled.push_back(static_cast<int>(std::lround(*min_line + (*max_line - *min_line) * ratio)));
+        filled.push_back(static_cast<int>(std::lround(first + (last - first) * ratio)));
     }
 
     return filled;
+}
+
+bool gridAspectMatches(const std::vector<int>& x_lines, const std::vector<int>& y_lines, const GridConfig& config)
+{
+    if (static_cast<int>(x_lines.size()) != config.cols + 1 ||
+        static_cast<int>(y_lines.size()) != config.rows + 1 ||
+        x_lines.empty() ||
+        y_lines.empty()) {
+        return false;
+    }
+
+    const double ratio_error = gridAspectError(x_lines.front(), x_lines.back(), y_lines.front(), y_lines.back(), config);
+    return ratio_error <= config.aspect_tolerance;
 }
 
 GridDetectionResult smoothGridDetections(
@@ -458,6 +614,36 @@ GridDetectionResult smoothGridDetections(
     }
 
     return smoothed;
+}
+
+double maxGridCornerDistance(const GridDetectionResult& previous, const GridDetectionResult& current)
+{
+    if (!previous.found || !current.found || previous.cells.size() != current.cells.size()) {
+        return std::numeric_limits<double>::infinity();
+    }
+
+    double max_distance = 0.0;
+    for (std::size_t cell_index = 0; cell_index < previous.cells.size(); ++cell_index) {
+        const GridCell& previous_cell = previous.cells[cell_index];
+        const GridCell& current_cell = current.cells[cell_index];
+
+        if (previous_cell.row != current_cell.row ||
+            previous_cell.col != current_cell.col ||
+            previous_cell.index != current_cell.index ||
+            previous_cell.corners.size() != current_cell.corners.size()) {
+            return std::numeric_limits<double>::infinity();
+        }
+
+        for (std::size_t corner_index = 0; corner_index < previous_cell.corners.size(); ++corner_index) {
+            const double dx = static_cast<double>(
+                current_cell.corners[corner_index].x - previous_cell.corners[corner_index].x);
+            const double dy = static_cast<double>(
+                current_cell.corners[corner_index].y - previous_cell.corners[corner_index].y);
+            max_distance = std::max(max_distance, std::sqrt(dx * dx + dy * dy));
+        }
+    }
+
+    return max_distance;
 }
 
 std::vector<DetectionResult> detectBlueBallsWithBuffers(
@@ -546,8 +732,15 @@ GridDetectionResult completeGridFromBounds(
         return GridDetectionResult{false, {}};
     }
 
-    const std::vector<int> completed_x = fillEvenlySpacedLinesFromBounds(x_lines, config.cols + 1);
-    const std::vector<int> completed_y = fillEvenlySpacedLinesFromBounds(y_lines, config.rows + 1);
+    const GridBoundsCandidate candidate = chooseBestGridBoundsCandidate(x_lines, y_lines, config);
+    if (!candidate.found) {
+        return GridDetectionResult{false, {}};
+    }
+
+    const std::vector<int> completed_x =
+        fillEvenlySpacedLinesFromBounds(candidate.left, candidate.right, config.cols + 1);
+    const std::vector<int> completed_y =
+        fillEvenlySpacedLinesFromBounds(candidate.top, candidate.bottom, config.rows + 1);
     return buildGridCells(completed_x, completed_y, config);
 }
 
@@ -598,7 +791,7 @@ GridDetectionResult detectWarehouseGrid(const cv::Mat& frame, const GridConfig& 
     const std::vector<int> y_lines = chooseGridLinePositions(clustered_y, config.rows + 1);
 
     GridDetectionResult grid = buildGridCells(x_lines, y_lines, config);
-    if (grid.found) {
+    if (grid.found && gridAspectMatches(x_lines, y_lines, config)) {
         return grid;
     }
 
@@ -611,6 +804,12 @@ GridDetectionResult updateGridTracker(
     const GridTrackerConfig& config)
 {
     if (raw_grid.found) {
+        if (state.last_good.found &&
+            maxGridCornerDistance(state.last_good, raw_grid) <= config.jitter_hold_threshold) {
+            state.missed_frames = 0;
+            return state.last_good;
+        }
+
         state.last_good = smoothGridDetections(state.last_good, raw_grid, config.smoothing_alpha);
         state.missed_frames = 0;
         return state.last_good;

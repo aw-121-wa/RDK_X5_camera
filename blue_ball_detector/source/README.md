@@ -41,10 +41,10 @@ If multiple blue balls are visible, the preview marks all detected blue balls. T
 To also mark the warehouse cell that contains each blue ball, enable grid detection and provide the fixed grid size:
 
 ```powershell
-D:\RDK_X5\blue_ball_detector\bin\blue_ball_detector.exe --camera auto --display --grid-enable --grid-rows 3 --grid-cols 4
+D:\RDK_X5\blue_ball_detector\bin\blue_ball_detector.exe --camera auto --display --grid-enable --grid-rows 3 --grid-cols 4 --cell-aspect 1.333333
 ```
 
-The preview detects visible warehouse grid lines, draws the blue-ball cells with yellow boxes, and labels cell numbers from left to right, top to bottom. If grid detection fails for a frame, the blue-ball overlay and CSV output continue normally and no wrong cell box is drawn.
+The preview detects visible warehouse grid lines, draws the blue-ball cells with yellow boxes, and labels cell numbers from left to right, top to bottom. It also uses the configured physical cell width/height ratio to reject grid candidates whose overall aspect is too far from the expected `cols * cell_aspect / rows`. If grid detection fails for a frame, the blue-ball overlay and CSV output continue normally and no wrong cell box is drawn.
 
 Grid overlay uses the last valid grid for a short time to avoid flickering when one or two grid lines are missed in a frame. The default cache is 15 frames:
 
@@ -52,10 +52,21 @@ Grid overlay uses the last valid grid for a short time to avoid flickering when 
 D:\RDK_X5\blue_ball_detector\bin\blue_ball_detector.exe --camera auto --display --grid-enable --grid-rows 3 --grid-cols 4 --grid-cache-frames 15
 ```
 
+If false yellow boxes are still common, lower the allowed aspect tolerance. If the grid is not detected because the camera is slightly tilted or the perspective is stronger, raise it a little:
+
+```powershell
+D:\RDK_X5\blue_ball_detector\bin\blue_ball_detector.exe --camera 1 --display --grid-enable --grid-rows 3 --grid-cols 4 --cell-aspect 1.333333 --grid-aspect-tolerance 0.35
+```
+
+Typical tuning range:
+
+- `--grid-aspect-tolerance 0.25`: stricter, fewer false boxes.
+- `--grid-aspect-tolerance 0.45`: looser, easier to detect under perspective or imperfect mounting.
+
 For faster PC startup, use the known camera index instead of automatic scanning:
 
 ```powershell
-D:\RDK_X5\blue_ball_detector\bin\blue_ball_detector.exe --camera 1 --display --grid-enable --grid-rows 3 --grid-cols 4
+D:\RDK_X5\blue_ball_detector\bin\blue_ball_detector.exe --camera 1 --display --grid-enable --grid-rows 3 --grid-cols 4 --cell-aspect 1.333333
 ```
 
 If automatic scanning is needed, limiting the scan range also reduces startup time:
@@ -128,8 +139,8 @@ The default HSV range is suitable for many blue objects:
 
 ```text
 H: 90-130
-S: 80-255
-V: 50-255
+S: 60-255
+V: 40-255
 ```
 
 Adjust it if the lighting or ball color changes:
@@ -141,16 +152,18 @@ Adjust it if the lighting or ball color changes:
 Other useful options:
 
 ```bash
-./build/blue_ball_detector --width 640 --height 480 --min-area 300 --rate-ms 100 --display
+./build/blue_ball_detector --width 640 --height 480 --min-area 150 --rate-ms 100 --display
 ```
 
 Warehouse grid overlay options:
 
 ```bash
-./build/blue_ball_detector --display --grid-enable --grid-rows 3 --grid-cols 4 --grid-cache-frames 15
+./build/blue_ball_detector --display --grid-enable --grid-rows 3 --grid-cols 4 --grid-cache-frames 15 --cell-aspect 1.333333 --grid-aspect-tolerance 0.35
 ```
 
 `--grid-enable` only affects the preview window. The CSV protocol remains the same 9 fields.
+`--cell-aspect` is the physical width/height ratio of one warehouse cell. The default is `1.333333` (4:3).
+`--grid-aspect-tolerance` is the accepted relative error of the detected whole-grid aspect ratio. The default is `0.35`.
 
 For higher processing/output frequency, remove the artificial delay:
 
