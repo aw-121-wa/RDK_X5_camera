@@ -33,6 +33,7 @@ struct ProgramOptions {
     int rate_ms = 100;
     bool display = false;
     GridConfig grid{false, 0, 0};
+    int grid_cache_frames = 15;
 };
 
 constexpr const char* kDisplayWindowName = "Blue Ball Detector";
@@ -113,6 +114,7 @@ void printUsage(const char* program)
         << "  --grid-enable     Detect warehouse grid and draw blue-ball cells in display mode\n"
         << "  --grid-rows N     Warehouse grid row count. Required with --grid-enable\n"
         << "  --grid-cols N     Warehouse grid column count. Required with --grid-enable\n"
+        << "  --grid-cache-frames N  Reuse last valid grid for N missed frames. Default: 15\n"
         << "  --help            Show this help message\n";
 }
 
@@ -158,6 +160,9 @@ ProgramOptions parseOptions(int argc, char** argv)
             options.grid.rows = parseIntValue(takeValue(i, argc, argv, arg, "--grid-rows"), "--grid-rows");
         } else if (isFlag(arg, "--grid-cols")) {
             options.grid.cols = parseIntValue(takeValue(i, argc, argv, arg, "--grid-cols"), "--grid-cols");
+        } else if (isFlag(arg, "--grid-cache-frames")) {
+            options.grid_cache_frames =
+                parseIntValue(takeValue(i, argc, argv, arg, "--grid-cache-frames"), "--grid-cache-frames");
         } else {
             throw std::invalid_argument("unknown option: " + arg);
         }
@@ -181,6 +186,9 @@ ProgramOptions parseOptions(int argc, char** argv)
     if (!options.grid.enabled && (options.grid.rows < 0 || options.grid.cols < 0)) {
         throw std::invalid_argument("--grid-rows and --grid-cols must be >= 0");
     }
+    if (options.grid_cache_frames < 0) {
+        throw std::invalid_argument("--grid-cache-frames must be >= 0");
+    }
 
     return options;
 }
@@ -188,11 +196,11 @@ ProgramOptions parseOptions(int argc, char** argv)
 bool readValidFrame(cv::VideoCapture& capture)
 {
     cv::Mat frame;
-    for (int attempt = 0; attempt < 5; ++attempt) {
+    for (int attempt = 0; attempt < 3; ++attempt) {
         if (capture.read(frame) && !frame.empty()) {
             return true;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
     }
     return false;
 }
@@ -394,6 +402,64 @@ GridDetectionResult buildGridCells(const std::vector<int>& x_lines, const std::v
     return result;
 }
 
+std::vector<int> fillEvenlySpacedLinesFromBounds(const std::vector<int>& lines, int expected_count)
+{
+    if (expected_count <= 1 || lines.size() < 2) {
+        return {};
+    }
+
+    const auto [min_line, max_line] = std::minmax_element(lines.begin(), lines.end());
+    if (*min_line == *max_line) {
+        return {};
+    }
+
+    std::vector<int> filled;
+    filled.reserve(static_cast<std::size_t>(expected_count));
+    for (int index = 0; index < expected_count; ++index) {
+        const double ratio = static_cast<double>(index) / (expected_count - 1);
+        filled.push_back(static_cast<int>(std::lround(*min_line + (*max_line - *min_line) * ratio)));
+    }
+
+    return filled;
+}
+
+GridDetectionResult smoothGridDetections(
+    const GridDetectionResult& previous,
+    const GridDetectionResult& current,
+    double smoothing_alpha)
+{
+    if (!previous.found || previous.cells.size() != current.cells.size()) {
+        return current;
+    }
+
+    const double alpha = std::clamp(smoothing_alpha, 0.0, 1.0);
+    GridDetectionResult smoothed = current;
+
+    for (std::size_t cell_index = 0; cell_index < smoothed.cells.size(); ++cell_index) {
+        GridCell& smoothed_cell = smoothed.cells[cell_index];
+        const GridCell& previous_cell = previous.cells[cell_index];
+        const GridCell& current_cell = current.cells[cell_index];
+
+        if (previous_cell.row != current_cell.row ||
+            previous_cell.col != current_cell.col ||
+            previous_cell.index != current_cell.index ||
+            previous_cell.corners.size() != current_cell.corners.size()) {
+            return current;
+        }
+
+        for (std::size_t corner_index = 0; corner_index < smoothed_cell.corners.size(); ++corner_index) {
+            smoothed_cell.corners[corner_index].x = static_cast<float>(
+                previous_cell.corners[corner_index].x * (1.0 - alpha) +
+                current_cell.corners[corner_index].x * alpha);
+            smoothed_cell.corners[corner_index].y = static_cast<float>(
+                previous_cell.corners[corner_index].y * (1.0 - alpha) +
+                current_cell.corners[corner_index].y * alpha);
+        }
+    }
+
+    return smoothed;
+}
+
 std::vector<DetectionResult> detectBlueBallsWithBuffers(
     const cv::Mat& frame,
     const HSVRange& hsv,
@@ -471,6 +537,20 @@ std::vector<DetectionResult> detectBlueBalls(const cv::Mat& frame, const HSVRang
     return detectBlueBallsWithBuffers(frame, hsv, min_area, buffers);
 }
 
+GridDetectionResult completeGridFromBounds(
+    const std::vector<int>& x_lines,
+    const std::vector<int>& y_lines,
+    const GridConfig& config)
+{
+    if (!config.enabled || config.rows <= 0 || config.cols <= 0) {
+        return GridDetectionResult{false, {}};
+    }
+
+    const std::vector<int> completed_x = fillEvenlySpacedLinesFromBounds(x_lines, config.cols + 1);
+    const std::vector<int> completed_y = fillEvenlySpacedLinesFromBounds(y_lines, config.rows + 1);
+    return buildGridCells(completed_x, completed_y, config);
+}
+
 GridDetectionResult detectWarehouseGrid(const cv::Mat& frame, const GridConfig& config)
 {
     if (!config.enabled || config.rows <= 0 || config.cols <= 0 || frame.empty()) {
@@ -517,7 +597,31 @@ GridDetectionResult detectWarehouseGrid(const cv::Mat& frame, const GridConfig& 
     const std::vector<int> x_lines = chooseGridLinePositions(clustered_x, config.cols + 1);
     const std::vector<int> y_lines = chooseGridLinePositions(clustered_y, config.rows + 1);
 
-    return buildGridCells(x_lines, y_lines, config);
+    GridDetectionResult grid = buildGridCells(x_lines, y_lines, config);
+    if (grid.found) {
+        return grid;
+    }
+
+    return completeGridFromBounds(clustered_x, clustered_y, config);
+}
+
+GridDetectionResult updateGridTracker(
+    const GridDetectionResult& raw_grid,
+    GridTrackerState& state,
+    const GridTrackerConfig& config)
+{
+    if (raw_grid.found) {
+        state.last_good = smoothGridDetections(state.last_good, raw_grid, config.smoothing_alpha);
+        state.missed_frames = 0;
+        return state.last_good;
+    }
+
+    ++state.missed_frames;
+    if (state.last_good.found && state.missed_frames <= config.cache_frames) {
+        return state.last_good;
+    }
+
+    return GridDetectionResult{false, {}};
 }
 
 const GridCell* findContainingCell(const std::vector<GridCell>& cells, cv::Point2f point)
@@ -688,7 +792,7 @@ std::vector<CameraCandidate> scanCameraCandidates(int scan_max)
 {
     std::vector<CameraCandidate> candidates;
 
-    for (int index = 0; index <= scan_max; ++index) {
+    for (int index : buildCameraScanOrder(scan_max)) {
         cv::VideoCapture capture;
         if (!capture.open(index)) {
             continue;
@@ -697,12 +801,39 @@ std::vector<CameraCandidate> scanCameraCandidates(int scan_max)
         if (readValidFrame(capture)) {
             candidates.push_back(CameraCandidate{index, true, isLikelyExternalCameraIndex(index)});
             capture.release();
+            if (candidates.back().likely_external) {
+                break;
+            }
         } else {
             capture.release();
         }
     }
 
     return candidates;
+}
+
+std::vector<int> buildCameraScanOrder(int scan_max)
+{
+    std::vector<int> order;
+    if (scan_max < 0) {
+        return order;
+    }
+
+#ifdef _WIN32
+    if (scan_max >= 1) {
+        order.push_back(1);
+    }
+    order.push_back(0);
+    for (int index = 2; index <= scan_max; ++index) {
+        order.push_back(index);
+    }
+#else
+    for (int index = 0; index <= scan_max; ++index) {
+        order.push_back(index);
+    }
+#endif
+
+    return order;
 }
 
 int choosePreferredCameraIndex(const std::vector<CameraCandidate>& candidates)
@@ -788,6 +919,8 @@ int runBlueBallDetector(int argc, char** argv)
 
     cv::Mat frame;
     DetectionBuffers detection_buffers;
+    GridTrackerState grid_tracker_state;
+    const GridTrackerConfig grid_tracker_config{options.grid_cache_frames, 0.35};
     while (true) {
         if (!capture.read(frame) || frame.empty()) {
             std::cerr << "Warning: failed to read frame\n";
@@ -802,9 +935,12 @@ int runBlueBallDetector(int argc, char** argv)
         std::cout << formatMetricsCsv(metrics) << std::endl;
 
         if (options.display) {
-            const GridDetectionResult grid = options.grid.enabled
+            const GridDetectionResult raw_grid = options.grid.enabled
                 ? detectWarehouseGrid(frame, options.grid)
                 : GridDetectionResult{false, {}};
+            const GridDetectionResult grid = options.grid.enabled
+                ? updateGridTracker(raw_grid, grid_tracker_state, grid_tracker_config)
+                : raw_grid;
             drawOverlay(frame, metrics, detections, grid);
             cv::imshow(kDisplayWindowName, frame);
 

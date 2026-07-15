@@ -305,6 +305,111 @@ void test_grid_detection_fails_for_empty_frame()
     assert(grid.cells.empty());
 }
 
+GridDetectionResult makeTwoByTwoGrid(float offset_x)
+{
+    return GridDetectionResult{
+        true,
+        std::vector<GridCell>{
+            GridCell{0, 0, 1, std::vector<cv::Point2f>{
+                cv::Point2f(offset_x + 0.0F, 0.0F),
+                cv::Point2f(offset_x + 50.0F, 0.0F),
+                cv::Point2f(offset_x + 50.0F, 50.0F),
+                cv::Point2f(offset_x + 0.0F, 50.0F)}},
+            GridCell{0, 1, 2, std::vector<cv::Point2f>{
+                cv::Point2f(offset_x + 50.0F, 0.0F),
+                cv::Point2f(offset_x + 100.0F, 0.0F),
+                cv::Point2f(offset_x + 100.0F, 50.0F),
+                cv::Point2f(offset_x + 50.0F, 50.0F)}},
+            GridCell{1, 0, 3, std::vector<cv::Point2f>{
+                cv::Point2f(offset_x + 0.0F, 50.0F),
+                cv::Point2f(offset_x + 50.0F, 50.0F),
+                cv::Point2f(offset_x + 50.0F, 100.0F),
+                cv::Point2f(offset_x + 0.0F, 100.0F)}},
+            GridCell{1, 1, 4, std::vector<cv::Point2f>{
+                cv::Point2f(offset_x + 50.0F, 50.0F),
+                cv::Point2f(offset_x + 100.0F, 50.0F),
+                cv::Point2f(offset_x + 100.0F, 100.0F),
+                cv::Point2f(offset_x + 50.0F, 100.0F)}}}};
+}
+
+void test_grid_tracker_updates_cache_when_grid_is_found()
+{
+    GridTrackerState state;
+    const GridTrackerConfig config{15, 0.5};
+    const GridDetectionResult raw = makeTwoByTwoGrid(0.0F);
+
+    const GridDetectionResult tracked = updateGridTracker(raw, state, config);
+
+    assert(tracked.found);
+    assert(state.last_good.found);
+    assert(state.missed_frames == 0);
+    assert(tracked.cells.size() == 4);
+}
+
+void test_grid_tracker_reuses_recent_grid_when_frame_detection_fails()
+{
+    GridTrackerState state;
+    const GridTrackerConfig config{2, 0.5};
+    updateGridTracker(makeTwoByTwoGrid(0.0F), state, config);
+
+    const GridDetectionResult tracked = updateGridTracker(GridDetectionResult{false, {}}, state, config);
+
+    assert(tracked.found);
+    assert(tracked.cells.size() == 4);
+    assert(state.missed_frames == 1);
+}
+
+void test_grid_tracker_expires_cached_grid_after_limit()
+{
+    GridTrackerState state;
+    const GridTrackerConfig config{2, 0.5};
+    updateGridTracker(makeTwoByTwoGrid(0.0F), state, config);
+
+    updateGridTracker(GridDetectionResult{false, {}}, state, config);
+    updateGridTracker(GridDetectionResult{false, {}}, state, config);
+    const GridDetectionResult expired = updateGridTracker(GridDetectionResult{false, {}}, state, config);
+
+    assert(!expired.found);
+    assert(expired.cells.empty());
+    assert(state.missed_frames == 3);
+}
+
+void test_grid_tracker_smooths_successive_grid_positions()
+{
+    GridTrackerState state;
+    const GridTrackerConfig config{15, 0.5};
+    updateGridTracker(makeTwoByTwoGrid(0.0F), state, config);
+
+    const GridDetectionResult tracked = updateGridTracker(makeTwoByTwoGrid(10.0F), state, config);
+
+    assert(tracked.found);
+    assert(std::abs(tracked.cells[0].corners[0].x - 5.0F) < 0.001F);
+}
+
+void test_completes_grid_from_outer_bounds_when_inner_lines_are_missing()
+{
+    const std::vector<int> x_lines{0, 100};
+    const std::vector<int> y_lines{0, 100};
+
+    const GridDetectionResult grid = completeGridFromBounds(x_lines, y_lines, GridConfig{true, 2, 2});
+
+    assert(grid.found);
+    assert(grid.cells.size() == 4);
+    assert(std::abs(grid.cells[1].corners[0].x - 50.0F) < 0.001F);
+    assert(grid.cells[3].index == 4);
+}
+
+void test_camera_scan_order_prioritizes_common_external_camera_on_windows()
+{
+    const std::vector<int> order = buildCameraScanOrder(3);
+
+#ifdef _WIN32
+    assert(order == std::vector<int>({1, 0, 2, 3}));
+#else
+    assert(order == std::vector<int>({0, 1, 2, 3}));
+#endif
+}
+
 void test_camera_selection_uses_only_available_camera()
 {
     const std::vector<CameraCandidate> candidates{
@@ -373,6 +478,12 @@ int main()
     test_finds_cell_containing_ball_center();
     test_draw_overlay_marks_blue_ball_cell_with_yellow_box();
     test_grid_detection_fails_for_empty_frame();
+    test_grid_tracker_updates_cache_when_grid_is_found();
+    test_grid_tracker_reuses_recent_grid_when_frame_detection_fails();
+    test_grid_tracker_expires_cached_grid_after_limit();
+    test_grid_tracker_smooths_successive_grid_positions();
+    test_completes_grid_from_outer_bounds_when_inner_lines_are_missing();
+    test_camera_scan_order_prioritizes_common_external_camera_on_windows();
     test_camera_selection_uses_only_available_camera();
     test_camera_selection_prefers_external_over_index_zero();
     test_camera_selection_uses_lowest_external_index();

@@ -46,6 +46,24 @@ D:\RDK_X5\blue_ball_detector\bin\blue_ball_detector.exe --camera auto --display 
 
 The preview detects visible warehouse grid lines, draws the blue-ball cells with yellow boxes, and labels cell numbers from left to right, top to bottom. If grid detection fails for a frame, the blue-ball overlay and CSV output continue normally and no wrong cell box is drawn.
 
+Grid overlay uses the last valid grid for a short time to avoid flickering when one or two grid lines are missed in a frame. The default cache is 15 frames:
+
+```powershell
+D:\RDK_X5\blue_ball_detector\bin\blue_ball_detector.exe --camera auto --display --grid-enable --grid-rows 3 --grid-cols 4 --grid-cache-frames 15
+```
+
+For faster PC startup, use the known camera index instead of automatic scanning:
+
+```powershell
+D:\RDK_X5\blue_ball_detector\bin\blue_ball_detector.exe --camera 1 --display --grid-enable --grid-rows 3 --grid-cols 4
+```
+
+If automatic scanning is needed, limiting the scan range also reduces startup time:
+
+```powershell
+D:\RDK_X5\blue_ball_detector\bin\blue_ball_detector.exe --camera auto --scan-max 2 --display --grid-enable --grid-rows 3 --grid-cols 4
+```
+
 Run without `--display` for pure CSV output:
 
 ```powershell
@@ -129,7 +147,7 @@ Other useful options:
 Warehouse grid overlay options:
 
 ```bash
-./build/blue_ball_detector --display --grid-enable --grid-rows 3 --grid-cols 4
+./build/blue_ball_detector --display --grid-enable --grid-rows 3 --grid-cols 4 --grid-cache-frames 15
 ```
 
 `--grid-enable` only affects the preview window. The CSV protocol remains the same 9 fields.

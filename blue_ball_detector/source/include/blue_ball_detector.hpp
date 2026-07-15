@@ -57,11 +57,31 @@ struct GridDetectionResult {
     std::vector<GridCell> cells;
 };
 
+struct GridTrackerConfig {
+    int cache_frames;
+    double smoothing_alpha;
+};
+
+struct GridTrackerState {
+    GridDetectionResult last_good{false, {}};
+    int missed_frames = 0;
+};
+
 DetectionResult detectBlueBall(const cv::Mat& frame, const HSVRange& hsv, double min_area);
 
 std::vector<DetectionResult> detectBlueBalls(const cv::Mat& frame, const HSVRange& hsv, double min_area);
 
 GridDetectionResult detectWarehouseGrid(const cv::Mat& frame, const GridConfig& config);
+
+GridDetectionResult completeGridFromBounds(
+    const std::vector<int>& x_lines,
+    const std::vector<int>& y_lines,
+    const GridConfig& config);
+
+GridDetectionResult updateGridTracker(
+    const GridDetectionResult& raw_grid,
+    GridTrackerState& state,
+    const GridTrackerConfig& config);
 
 const GridCell* findContainingCell(const std::vector<GridCell>& cells, cv::Point2f point);
 
@@ -80,6 +100,8 @@ void drawOverlay(
     const GridDetectionResult& grid);
 
 std::vector<CameraCandidate> scanCameraCandidates(int scan_max);
+
+std::vector<int> buildCameraScanOrder(int scan_max);
 
 int choosePreferredCameraIndex(const std::vector<CameraCandidate>& candidates);
 
